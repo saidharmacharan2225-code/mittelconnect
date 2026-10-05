@@ -1,0 +1,15 @@
+.env
+secrets/
+data/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+.venv/
+deploy/hetzner/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+monitor/mcmon

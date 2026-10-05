@@ -1,0 +1,108 @@
+# =============================================================================
+# MittelConnect production stack (one customer site per host)
+#
+#   middleware  Python daemon: legacy DB -> SAP, hardened container
+#   monitor     Go sidecar (mcmon): /metrics, /healthz, /readyz
+#
+# Site files live outside the code checkout, under MC_SITE_DIR
+# (default /srv/mittelconnect/site), created by scripts/site_init.sh:
+#   config.yaml          site configuration (copied from config.yaml)
+#   .env                 ENC[...] secrets and site settings (0600)
+#   secrets/master.key   Fernet master key (0400, uid 10001)
+#   data/                outbox, dead letters, watermarks, heartbeat (0700, uid 10001)
+#
+# Run (normally via scripts/deploy.sh):
+#   docker compose -f deploy/docker-compose.prod.yml \
+#     --env-file /srv/mittelconnect/site/.env up -d --build
+# =============================================================================
+
+name: mittelconnect
+
+services:
+  middleware:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: ${MC_IMAGE:-mittelconnect:1.0.0}
+    init: true
+    environment:
+      MC_INSTANCE_NAME: ${MC_SITE_NAME:?MC_SITE_NAME missing in site .env}
+      MC_LOG_LEVEL: ${MC_LOG_LEVEL:-INFO}
+      MC_LOG_FORMAT: json
+      MC_MSSQL_PASSWORD: ${MC_MSSQL_PASSWORD_ENC:-}
+      MC_ORACLE_PASSWORD: ${MC_ORACLE_PASSWORD_ENC:-}
+      MC_SAP_CLIENT_SECRET: ${MC_SAP_CLIENT_SECRET_ENC:-}
+      MC_SAP_PASSWORD: ${MC_SAP_PASSWORD_ENC:-}
+      MC_PSEUDONYMIZATION_KEY: ${MC_PSEUDONYMIZATION_KEY_ENC:?MC_PSEUDONYMIZATION_KEY_ENC missing in site .env}
+      MC_HEALTH_MAX_AGE_SECONDS: ${MC_HEALTH_MAX_AGE_SECONDS:-600}
+    secrets:
+      - source: master_key
+        target: mittelconnect_master.key
+    volumes:
+      - ${MC_SITE_DIR:-/srv/mittelconnect/site}/config.yaml:/app/config/config.yaml:ro
+      - ${MC_SITE_DIR:-/srv/mittelconnect/site}/data:/app/data
+      # Optional customer CA bundle for SAP TLS (point sap.tls.ca_bundle at /app/certs/...).
+      - ${MC_SITE_DIR:-/srv/mittelconnect/site}/certs:/app/certs:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "${MC_CPUS:-1.5}"
+          memory: ${MC_MEMORY:-1G}
+          pids: 256
+    stop_grace_period: 45s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "10"
+
+  monitor:
+    build:
+      context: ../monitor
+    image: ${MCMON_IMAGE:-mittelconnect-monitor:1.0.0}
+    environment:
+      MCMON_LISTEN: ":9464"
+      MCMON_CACHE_PATH: /app/data/mittelconnect_cache.db
+      MCMON_HEARTBEAT_FILE: /app/data/heartbeat
+      MCMON_HEALTH_MAX_AGE_SECONDS: ${MC_HEALTH_MAX_AGE_SECONDS:-600}
+      MCMON_SOURCE_TZ: ${MC_SOURCE_TZ:-Europe/Berlin}
+      MCMON_SITE: ${MC_SITE_NAME:?MC_SITE_NAME missing in site .env}
+    volumes:
+      # Read-write mount because SQLite readers of a WAL database need the
+      # shared-memory file; mcmon itself opens the database with mode=ro.
+      - ${MC_SITE_DIR:-/srv/mittelconnect/site}/data:/app/data
+    ports:
+      # Published only on the private address (Hetzner private network or
+      # WireGuard), never on the public interface.
+      - "${MCMON_BIND:-127.0.0.1}:${MCMON_PORT:-9464}:9464"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+          pids: 64
+    depends_on:
+      - middleware
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+secrets:
+  master_key:
+    file: ${MC_SITE_DIR:-/srv/mittelconnect/site}/secrets/master.key

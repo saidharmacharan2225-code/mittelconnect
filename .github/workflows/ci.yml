@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install system ODBC headers for pyodbc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends unixodbc-dev
+      - run: pip install -r requirements.txt
+      - run: python -m compileall -q core main.py mock_sap
+      - run: python -m unittest discover -s tests -t . -v
+
+  go:
+    name: Go monitor
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: monitor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: monitor/go.mod
+          cache-dependency-path: monitor/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      - run: CGO_ENABLED=0 go build -trimpath -o /dev/null .
+
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck scripts/*.sh sandbox/mssql/*.sh
+
+  terraform:
+    name: Terraform (Hetzner)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: deploy/hetzner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+
+  images:
+    name: Build and scan images
+    runs-on: ubuntu-24.04
+    needs: [python, go]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build middleware image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: mittelconnect:ci
+          cache-from: type=gha,scope=middleware
+          cache-to: type=gha,mode=max,scope=middleware
+      - name: Build monitor image
+        uses: docker/build-push-action@v6
+        with:
+          context: monitor
+          load: true
+          tags: mittelconnect-monitor:ci
+          cache-from: type=gha,scope=monitor
+          cache-to: type=gha,mode=max,scope=monitor
+      - name: Smoke test middleware image
+        run: |
+          docker run --rm --network none mittelconnect:ci --version
+          docker run --rm --network none --entrypoint python mittelconnect:ci -c "import pyodbc, oracledb; print(pyodbc.drivers())" | grep -q "ODBC Driver 18 for SQL Server"
+      - name: Smoke test monitor image
+        run: docker run --rm --network none mittelconnect-monitor:ci -help 2>&1 | grep -q -- "-healthcheck"
+      - name: Scan middleware image (fixable HIGH/CRITICAL fail the build)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: mittelconnect:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Scan monitor image
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: mittelconnect-monitor:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"

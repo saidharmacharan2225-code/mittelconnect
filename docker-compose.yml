@@ -1,0 +1,164 @@
+# =============================================================================
+# MittelConnect local sandbox
+#
+#   mssql        Mock legacy ERP: SQL Server 2022 (Developer edition)
+#   mssql-init   One-shot: waits for SQL Server, seeds PRODUKTION, creates mc_reader
+#   simulator    Inserts a new stock booking every 15 s (continuous data stream)
+#   mock-sap     Mock SAP S/4HANA gateway (OAuth2, CSRF, OData V2 $batch)
+#   middleware   MittelConnect itself, hardened (non-root, read-only rootfs)
+#
+# First run:   ./scripts/bootstrap_sandbox.sh      (creates secrets/ and .env)
+# Start:       docker compose up -d --build
+# Logs:        docker compose logs -f middleware
+# Received:    curl -s http://127.0.0.1:8080/_mock/stats
+# Stop:        docker compose down      (add -v to wipe all data)
+#
+# Apple Silicon: SQL Server is amd64-only and runs under Rosetta emulation
+# (Docker Desktop > Settings > "Use Rosetta for x86_64/amd64 emulation").
+# =============================================================================
+
+name: mittelconnect-sandbox
+
+x-mssql-env: &mssql-env
+  MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?run scripts/bootstrap_sandbox.sh first}
+  MSSQL_HOST: mssql
+
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: "Developer"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?run scripts/bootstrap_sandbox.sh first}
+      MSSQL_COLLATION: "Latin1_General_CI_AS"
+    ports:
+      # Bound to localhost only, for SSMS / Azure Data Studio inspection.
+      - "127.0.0.1:14330:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+    networks:
+      - plant
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -l 5 -Q 'SELECT 1' > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 8s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  mssql-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    entrypoint: ["/bin/bash", "/seed/init.sh"]
+    environment:
+      <<: *mssql-env
+      MC_READER_PASSWORD: ${MC_READER_PASSWORD:?run scripts/bootstrap_sandbox.sh first}
+    volumes:
+      - ./sandbox/mssql:/seed:ro
+    networks:
+      - plant
+    depends_on:
+      mssql:
+        condition: service_healthy
+    restart: "no"
+
+  simulator:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    entrypoint: ["/bin/bash", "/seed/simulate_production.sh"]
+    environment:
+      <<: *mssql-env
+      SIMULATOR_INTERVAL: ${SIMULATOR_INTERVAL:-15}
+    volumes:
+      - ./sandbox/mssql:/seed:ro
+    networks:
+      - plant
+    depends_on:
+      mssql-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  mock-sap:
+    build:
+      context: ./mock_sap
+    image: mittelconnect-mock-sap:1.0.0
+    environment:
+      MOCK_SAP_CLIENT_ID: "MITTELCONNECT"
+      MOCK_SAP_CLIENT_SECRET: ${MOCK_SAP_CLIENT_SECRET:?run scripts/bootstrap_sandbox.sh first}
+      MOCK_SAP_TOKEN_TTL: "300"
+      MOCK_SAP_OUTPUT: "/data/received.jsonl"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - mock-sap-data:/data
+    networks:
+      - sap
+    restart: unless-stopped
+
+  middleware:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mittelconnect:1.0.0
+    init: true
+    environment:
+      MC_LOG_LEVEL: ${MC_LOG_LEVEL:-INFO}
+      MC_LOG_FORMAT: ${MC_LOG_FORMAT:-json}
+      MC_MSSQL_PASSWORD: ${MC_MSSQL_PASSWORD_ENC:?run scripts/bootstrap_sandbox.sh first}
+      MC_SAP_CLIENT_SECRET: ${MC_SAP_CLIENT_SECRET_ENC:?run scripts/bootstrap_sandbox.sh first}
+      MC_PSEUDONYMIZATION_KEY: ${MC_PSEUDONYMIZATION_KEY_ENC:?run scripts/bootstrap_sandbox.sh first}
+      MC_HEALTH_MAX_AGE_SECONDS: "180"
+    secrets:
+      # Mounted read-only at /run/secrets/mittelconnect_master.key. The host
+      # file is world-readable (so uid 10001 can read it) but sits inside the
+      # 0700 secrets/ directory, which only your host user can enter.
+      - source: mittelconnect_master_key
+        target: mittelconnect_master.key
+    volumes:
+      - ./sandbox/config.sandbox.yaml:/app/config/config.yaml:ro
+      - middleware-data:/app/data
+    networks:
+      - plant
+      - sap
+    depends_on:
+      mssql-init:
+        condition: service_completed_successfully
+      mock-sap:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    stop_grace_period: 30s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+secrets:
+  mittelconnect_master_key:
+    file: ./secrets/master.key
+
+volumes:
+  mssql-data:
+  mock-sap-data:
+  middleware-data:
+
+networks:
+  # Shop-floor network: legacy database and middleware only.
+  plant:
+    driver: bridge
+  # SAP-facing network: middleware and the (mock) SAP gateway only.
+  sap:
+    driver: bridge

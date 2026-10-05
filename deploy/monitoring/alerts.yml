@@ -1,0 +1,77 @@
+# Prometheus alerting rules for MittelConnect (metrics from the mcmon sidecar).
+# Load with: rule_files: ["/etc/prometheus/mittelconnect-alerts.yml"]
+# Severity "page" maps to the 4-hour P1 response in the support contract.
+groups:
+  - name: mittelconnect
+    rules:
+      - alert: MittelConnectMonitorDown
+        expr: up{job="mittelconnect"} == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "MittelConnect host {{ $labels.instance }} unreachable"
+          description: "Prometheus cannot scrape mcmon. The host, Docker or the private network is down."
+
+      - alert: MittelConnectCacheUnreadable
+        expr: mittelconnect_cache_up == 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Local cache unreadable at {{ $labels.site }}"
+          description: "mcmon cannot read the outbox database. Check the data volume and disk space (RUNBOOK section 7)."
+
+      - alert: MittelConnectStalled
+        expr: mittelconnect_heartbeat_age_seconds > 900 or mittelconnect_heartbeat_present == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "No completed pipeline cycle at {{ $labels.site }} for 15 minutes"
+          description: "The middleware daemon is crashed, stuck in a cycle, or cannot reach the source database."
+
+      - alert: MittelConnectSapBacklog
+        expr: max by (site, job_name) (mittelconnect_outbox_oldest_age_seconds) > 3600
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "SAP delivery backlog older than 1h at {{ $labels.site }} ({{ $labels.job_name }})"
+          description: "Records are parked in the encrypted outbox. SAP is unreachable or rejecting batches; see OUTAGE_DRILL.md."
+
+      - alert: MittelConnectOutboxNearLimit
+        expr: sum by (site) (mittelconnect_outbox_records) > 400000
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "Outbox at {{ $labels.site }} is above 80% of max_outbox_records"
+          description: "At 500000 parked records extraction pauses (backpressure). Restore SAP connectivity or raise the limit and the data volume."
+
+      - alert: MittelConnectReplayAttemptsHigh
+        expr: max by (site, job_name) (mittelconnect_outbox_max_attempts) >= 40
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox entries close to max_replay_attempts at {{ $labels.site }}"
+          description: "Entries move to dead letters after 50 attempts. Investigate before data needs manual replay."
+
+      - alert: MittelConnectDeadLettersIncreasing
+        expr: sum by (site, job_name) (delta(mittelconnect_dead_letters[1h])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "New dead letters at {{ $labels.site }} ({{ $labels.job_name }})"
+          description: "SAP or validation rejected records in the last hour. Review with `main.py status` and fix mapping or master data."
+
+      - alert: MittelConnectWatermarkNotAdvancing
+        expr: mittelconnect_watermark_updated_age_seconds > 86400
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.job_name }} at {{ $labels.site }} has not advanced for 24h"
+          description: "Either the source table had no changes (weekend, plant shutdown) or extraction is failing. Compare with the source."

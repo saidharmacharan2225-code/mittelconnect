@@ -1,0 +1,16 @@
+# Copy to terraform.tfvars (gitignored) and fill in. The API token is passed
+# separately: export TF_VAR_hcloud_token=...
+location             = "nbg1"
+default_server_type  = "cx23"
+admin_ssh_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq8xkVd2m3dq9ZcOR1lB0W8l6hXJmQe0sY3q1Vb7Xf operator@laptop"
+admin_cidrs          = ["203.0.113.10/32"]
+
+sites = {
+  "mueller-werk-01" = {
+    host_index          = 1
+    plant_wg_public_key = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="
+    plant_lan_cidrs     = ["192.168.10.0/24"]
+    # The plant router dials in (behind NAT), so no endpoint is needed here.
+    plant_endpoint = null
+  }
+}

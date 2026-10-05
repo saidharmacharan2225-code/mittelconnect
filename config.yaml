@@ -1,0 +1,274 @@
+# =============================================================================
+# MittelConnect middleware configuration
+# =============================================================================
+# Value resolution rules (applied by core/settings.py at load time):
+#   ${ENV_NAME}            -> replaced with the environment variable ENV_NAME
+#   ${ENV_NAME:-default}   -> environment variable, or "default" when unset
+#   ENC[gAAAAA...]         -> Fernet ciphertext, decrypted in memory with the
+#                             master key (never written back to disk in clear)
+#
+# Encrypt a secret for this file:
+#   python main.py encrypt-secret            (prompts, no shell history)
+# Generate a new master key:
+#   python main.py generate-key --out /run/secrets/mittelconnect_master.key
+# =============================================================================
+
+service:
+  instance_name: "${MC_INSTANCE_NAME:-werk-01}"
+  # Seconds between pipeline cycles in daemon mode.
+  poll_interval_seconds: 60
+  # Hard cap for a single cycle; a cycle exceeding this is cancelled and logged.
+  cycle_timeout_seconds: 1800
+  # Heartbeat file touched after every cycle (used by the Docker healthcheck).
+  heartbeat_file: "${MC_HEARTBEAT_FILE:-./data/heartbeat}"
+  # Seconds to wait for the in-flight cycle to finish after SIGTERM/SIGINT.
+  shutdown_grace_seconds: 30
+
+logging:
+  level: "${MC_LOG_LEVEL:-INFO}"
+  # "json" for log shippers (Loki, Graylog, ELK), "text" for humans.
+  format: "${MC_LOG_FORMAT:-json}"
+  # Optional rotating file in addition to stdout. Empty string disables it.
+  file: "${MC_LOG_FILE:-}"
+  file_max_bytes: 10485760
+  file_backup_count: 10
+
+security:
+  # Master key source, checked in this order:
+  #   1. environment variable named by master_key_env
+  #   2. file at master_key_file (Docker/Kubernetes secret mount)
+  master_key_env: "MITTELCONNECT_MASTER_KEY"
+  master_key_file: "${MC_MASTER_KEY_FILE:-/run/secrets/mittelconnect_master.key}"
+  # Key for HMAC-SHA256 pseudonymisation of personal data (GDPR Art. 4(5)).
+  # Must be a different secret from the master key. Store encrypted.
+  pseudonymization_key: "${MC_PSEUDONYMIZATION_KEY}"
+  # Encrypt payloads parked in the local outbox (encryption at rest).
+  encrypt_outbox: true
+  # Data sovereignty guard: outbound hosts must end with one of these suffixes.
+  # The SAP client refuses to connect anywhere else.
+  allowed_host_suffixes:
+    - ".example-werk.de"
+    - ".s4hana.ondemand.com"
+    - "localhost"
+    - "127.0.0.1"
+
+cache:
+  # Persistent SQLite store for the outbox, dead letters and watermarks.
+  sqlite_path: "${MC_CACHE_PATH:-./data/mittelconnect_cache.db}"
+  # Maximum replay attempts before an outbox entry is moved to dead letters.
+  max_replay_attempts: 50
+  # Outbox entries replayed per cycle (bounded to protect SAP after an outage).
+  replay_batch_limit: 200
+  # Backoff for outbox replays (seconds), exponential with jitter.
+  replay_base_delay_seconds: 30
+  replay_max_delay_seconds: 3600
+  # Dead letters older than this are purged (data minimisation, GDPR Art. 5(1)(e)).
+  dead_letter_retention_days: 30
+  # Keep extracting into the outbox while SAP is down. Set to false when the
+  # source database itself is a durable buffer and should simply be re-read.
+  extract_while_sap_down: true
+  # Backpressure: stop extracting once this many records are parked locally.
+  max_outbox_records: 500000
+
+databases:
+  erp_legacy_mssql:
+    type: "mssql"
+    driver: "ODBC Driver 18 for SQL Server"
+    host: "${MC_MSSQL_HOST:-mssql-legacy.example-werk.de}"
+    port: 1433
+    database: "${MC_MSSQL_DATABASE:-PRODUKTION}"
+    username: "${MC_MSSQL_USER:-mc_reader}"
+    # Example: ENC[...] produced by `python main.py encrypt-secret`.
+    password: "${MC_MSSQL_PASSWORD}"
+    encrypt: true
+    trust_server_certificate: false
+    login_timeout_seconds: 15
+    query_timeout_seconds: 300
+    # Legacy systems from the 1990s/2000s commonly store text as Windows-1252.
+    legacy_encoding: "cp1252"
+    connect_retries: 5
+    connect_base_delay_seconds: 2
+    connect_max_delay_seconds: 60
+
+  qs_oracle:
+    type: "oracle"
+    host: "${MC_ORACLE_HOST:-oracle-qs.example-werk.de}"
+    port: 1521
+    service_name: "${MC_ORACLE_SERVICE:-QSPROD}"
+    username: "${MC_ORACLE_USER:-MC_READER}"
+    password: "${MC_ORACLE_PASSWORD}"
+    # Set to a wallet/TCPS DSN in production when the listener supports TLS.
+    protocol: "tcp"
+    query_timeout_seconds: 300
+    legacy_encoding: "cp1252"
+    connect_retries: 5
+    connect_base_delay_seconds: 2
+    connect_max_delay_seconds: 60
+
+sap:
+  base_url: "${MC_SAP_BASE_URL:-https://s4.example-werk.de}"
+  # SAP client (Mandant) appended as sap-client query parameter.
+  sap_client: "${MC_SAP_CLIENT:-100}"
+  # "oauth2" (client credentials) or "basic" (communication user).
+  auth_mode: "oauth2"
+  oauth2:
+    token_url: "${MC_SAP_TOKEN_URL:-https://s4.example-werk.de/sap/bc/sec/oauth2/token}"
+    client_id: "${MC_SAP_CLIENT_ID:-MITTELCONNECT}"
+    client_secret: "${MC_SAP_CLIENT_SECRET}"
+    scope: ""
+    # Refresh the token this many seconds before it expires.
+    refresh_skew_seconds: 60
+  basic:
+    username: "${MC_SAP_USER:-}"
+    password: "${MC_SAP_PASSWORD:-}"
+  tls:
+    verify: true
+    # Path to a PEM bundle containing the customer's internal CA, or empty.
+    ca_bundle: "${MC_SAP_CA_BUNDLE:-}"
+    # Optional mutual TLS client certificate (X.509 communication user).
+    client_cert: "${MC_SAP_CLIENT_CERT:-}"
+    client_key: "${MC_SAP_CLIENT_KEY:-}"
+  # Refuse plain http:// endpoints unless explicitly enabled for a sandbox.
+  allow_insecure_http: false
+  timeouts:
+    connect_seconds: 10
+    read_seconds: 120
+    write_seconds: 60
+    pool_seconds: 10
+  max_connections: 10
+  # Records per OData $batch request.
+  batch_size: 100
+  # true: one changeset per batch (all-or-nothing in SAP).
+  # false: one changeset per record (a bad record does not block the others).
+  atomic_batches: false
+  retry:
+    max_attempts: 5
+    base_delay_seconds: 1
+    max_delay_seconds: 30
+  circuit_breaker:
+    # Consecutive failures that open the breaker.
+    failure_threshold: 5
+    # Seconds the breaker stays open before a single trial request.
+    recovery_timeout_seconds: 120
+
+# -----------------------------------------------------------------------------
+# Extraction jobs. Each job pulls rows incrementally from one database and
+# posts them to one OData entity set.
+#
+# query:            must reference the bind parameter :watermark and must be
+#                   ordered by the watermark column so progress is monotonic.
+#                   ISO-8601 watermarks are bound as native datetime values.
+# watermark_column: column (as returned in the result set) used to advance.
+# initial_watermark: used on the very first run.
+# mapping:          target SAP field -> transformation rule
+#   source:         source column name (case-insensitive)
+#   type:           string | int | decimal | bool | date | datetime | constant
+#   max_length:     truncate strings to SAP field length
+#   required:       missing/empty value sends the record to dead letters
+#   default:        value used when source is NULL
+#   pseudonymize:   replace value with HMAC-SHA256 pseudonym (personal data)
+#   value:          literal for type "constant"
+#   scale:          decimal places for type "decimal"
+#   upper:          upper-case strings (SAP keys are usually upper-case)
+#   value_map:      dictionary translating legacy codes to SAP codes
+# -----------------------------------------------------------------------------
+jobs:
+  - name: "material_stock_sync"
+    enabled: true
+    source: "erp_legacy_mssql"
+    chunk_size: 5000
+    # Naive timestamps in the legacy DB are interpreted in this zone.
+    source_timezone: "Europe/Berlin"
+    watermark_column: "LastChanged"
+    initial_watermark: "2000-01-01T00:00:00"
+    query: >
+      SELECT ArtikelNr, Bezeichnung, Werk, Lagerort, Bestand, Mengeneinheit,
+             LetzterBearbeiter, LastChanged
+      FROM dbo.Lagerbestand WITH (NOLOCK)
+      WHERE LastChanged > :watermark
+      ORDER BY LastChanged ASC
+    sap:
+      service_path: "/sap/opu/odata/sap/API_MATERIAL_STOCK_SRV"
+      entity_set: "A_MatlStkInAcctMod"
+    mapping:
+      Material:
+        source: "ArtikelNr"
+        type: "string"
+        max_length: 40
+        required: true
+        upper: true
+      Plant:
+        source: "Werk"
+        type: "string"
+        max_length: 4
+        required: true
+      StorageLocation:
+        source: "Lagerort"
+        type: "string"
+        max_length: 4
+      MatlWrhsStkQtyInMatlBaseUnit:
+        source: "Bestand"
+        type: "decimal"
+        scale: 3
+        required: true
+      MaterialBaseUnit:
+        source: "Mengeneinheit"
+        type: "string"
+        max_length: 3
+        value_map:
+          STK: "ST"
+          KG: "KG"
+          M: "M"
+          L: "L"
+      YY1_LastEditor_MMD:
+        source: "LetzterBearbeiter"
+        type: "string"
+        pseudonymize: true
+      YY1_SourceSystem_MMD:
+        type: "constant"
+        value: "LEGACY_MSSQL"
+
+  - name: "quality_inspection_sync"
+    enabled: true
+    source: "qs_oracle"
+    chunk_size: 2000
+    source_timezone: "Europe/Berlin"
+    watermark_column: "PRUEFDATUM"
+    initial_watermark: "2000-01-01T00:00:00"
+    query: >
+      SELECT PRUEFLOS, ARTIKELNR, WERK, PRUEFDATUM, ERGEBNIS, PRUEFER_NAME
+      FROM QS.PRUEFERGEBNISSE
+      WHERE PRUEFDATUM > :watermark
+      ORDER BY PRUEFDATUM ASC
+    sap:
+      service_path: "/sap/opu/odata/sap/API_INSPECTIONLOT_SRV"
+      entity_set: "A_InspLotUsageDecision"
+    mapping:
+      InspectionLot:
+        source: "PRUEFLOS"
+        type: "string"
+        max_length: 12
+        required: true
+      Material:
+        source: "ARTIKELNR"
+        type: "string"
+        max_length: 40
+        upper: true
+      Plant:
+        source: "WERK"
+        type: "string"
+        max_length: 4
+      InspLotUsageDecisionDate:
+        source: "PRUEFDATUM"
+        type: "date"
+      InspLotUsageDecisionCode:
+        source: "ERGEBNIS"
+        type: "string"
+        value_map:
+          OK: "A"
+          NOK: "R"
+          SONDERFREIGABE: "A2"
+      InspLotUsgeDcsnPerson:
+        source: "PRUEFER_NAME"
+        type: "string"
+        pseudonymize: true
