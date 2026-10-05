@@ -304,6 +304,33 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recovered.outbox_records, 0)
         self.assertEqual(len(self.fake.received), 29)
 
+    async def test_long_outage_never_dead_letters(self) -> None:
+        self.fake.down = True
+        for _ in range(8):  # max_replay_attempts is 5 in the test config
+            report = await self.pipeline.run_cycle()
+        self.assertEqual(report.outbox_records, 30)
+        self.assertEqual(report.dead_letters, 0)
+
+        self.fake.down = False
+        recovered = await self.pipeline.run_cycle()
+        self.assertEqual(recovered.replayed_ok, 29)
+        self.assertEqual(recovered.outbox_records, 0)
+
+    async def test_transform_error_dead_letter_is_pseudonymised(self) -> None:
+        conn = sqlite3.connect(self.source)
+        conn.execute(
+            "INSERT INTO Lagerbestand VALUES ('', '1000', '1', 'STK', 'Erika Mustermann', '2024-01-01T09:00:00')"
+        )
+        conn.commit()
+        conn.close()
+        report = await self.pipeline.run_cycle()
+        self.assertEqual(report.jobs[0].transform_errors, 1)
+        rows = sqlite3.connect(self.tmp / "cache.db").execute("SELECT payload, encrypted FROM dead_letters").fetchall()
+        payloads = [self.pipeline.store._open(payload, encrypted) for payload, encrypted in rows]
+        flat = json.dumps(payloads, ensure_ascii=False)
+        self.assertNotIn("Erika Mustermann", flat)
+        self.assertIn("PSN", flat)
+
     async def test_token_refresh_on_401(self) -> None:
         self.fake.expire_next_token = True
         report = await self.pipeline.run_cycle()

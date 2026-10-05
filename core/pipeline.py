@@ -229,6 +229,23 @@ class Transformer:
                 f"Job {job_name} pseudonymises fields but security.pseudonymization_key is not set"
             )
 
+    def redact(self, row: dict) -> dict:
+        """Source row safe to keep in dead letters: every column that feeds a
+        pseudonymised field is replaced by its pseudonym, so personal data never
+        rests in clear text locally, not even for rows that failed to transform."""
+        personal = {
+            str(rule["source"]).lower()
+            for rule in self.mapping.values()
+            if rule.get("pseudonymize") and "source" in rule
+        }
+        if not personal:
+            return dict(row)
+        assert self.pseudonymizer is not None
+        return {
+            key: self.pseudonymizer.pseudonymize(value) if str(key).lower() in personal else value
+            for key, value in row.items()
+        }
+
     def transform(self, row: dict) -> dict:
         lowered = {str(key).lower(): value for key, value in row.items()}
         record: dict[str, Any] = {}
@@ -492,11 +509,17 @@ class Pipeline:
                 continue
             try:
                 result = await self.sap.post_batch(entry["service_path"], entry["entity_set"], records)
-            except (SAP_DOWN_ERRORS + (SAPAuthError, SAPRequestError, SAPError)) as exc:
+            except SAP_DOWN_ERRORS as exc:
+                # An unreachable SAP says nothing about the records themselves, so
+                # outage time never counts towards max_replay_attempts: buffered
+                # records wait for as long as the outage lasts and are never
+                # moved to dead letters just because SAP was down.
+                delay = backoff_delay(attempts, self.replay_base, self.replay_max)
+                self.store.reschedule(entry_id, attempts - 1, delay, str(exc))
+                logger.warning("SAP still unavailable; outbox replay paused: %s", exc)
+                break
+            except (SAPAuthError, SAPRequestError, SAPError) as exc:
                 self._reschedule_or_bury(entry, attempts, str(exc), records)
-                if isinstance(exc, SAP_DOWN_ERRORS):
-                    logger.warning("SAP still unavailable; outbox replay paused: %s", exc)
-                    break
                 continue
 
             rejected = [records[r.index] for r in result.rejected]
@@ -561,7 +584,7 @@ class Pipeline:
                         records.append(transformer.transform(row))
                     except TransformError as exc:
                         report.transform_errors += 1
-                        self.store.dead_letter(name, [_jsonable(row)], f"transform: {exc}")
+                        self.store.dead_letter(name, [_jsonable(transformer.redact(row))], f"transform: {exc}")
                 await self._deliver(job, records, report)
 
                 values = [{str(k).lower(): v for k, v in row.items()}.get(wm_column) for row in chunk]
