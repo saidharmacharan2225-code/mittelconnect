@@ -25,7 +25,8 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt \
- && python -c "import yaml, cryptography, httpx, oracledb, tzdata" 
+ && python -c "import yaml, cryptography, httpx, oracledb, tzdata" \
+ && pip uninstall -y setuptools wheel
 
 # ----------------------------------------------------------------- runtime
 FROM ${PYTHON_IMAGE} AS runtime
@@ -48,6 +49,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Microsoft ODBC Driver 18 for SQL Server (signed Microsoft apt repository).
 RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
  && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
     | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
@@ -63,6 +65,10 @@ RUN groupadd --system --gid ${APP_GID} mittelconnect \
     --no-create-home --shell /usr/sbin/nologin mittelconnect
 
 COPY --from=builder /opt/venv /opt/venv
+
+# The service never installs packages at runtime; drop the base image's
+# build tooling (and the libraries it vendors) from the attack surface.
+RUN python -m pip uninstall -y setuptools wheel
 
 WORKDIR /app
 COPY --chown=root:root main.py ./
