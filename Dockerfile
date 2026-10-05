@@ -68,7 +68,8 @@ COPY --from=builder /opt/venv /opt/venv
 
 # The service never installs packages at runtime; drop the base image's
 # build tooling (and the libraries it vendors) from the attack surface.
-RUN python -m pip uninstall -y setuptools wheel
+# Explicit path: "python" on PATH is already the venv interpreter here.
+RUN /usr/local/bin/python -m pip uninstall -y setuptools wheel
 
 WORKDIR /app
 COPY --chown=root:root main.py ./
