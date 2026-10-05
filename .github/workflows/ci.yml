@@ -96,17 +96,17 @@ jobs:
           docker run --rm --network none --entrypoint python mittelconnect:ci -c "import pyodbc, oracledb; print(pyodbc.drivers())" | grep -q "ODBC Driver 18 for SQL Server"
       - name: Smoke test monitor image
         run: docker run --rm --network none mittelconnect-monitor:ci -help 2>&1 | grep -q -- "-healthcheck"
-      - name: Scan middleware image (fixable HIGH/CRITICAL fail the build)
-        uses: aquasecurity/trivy-action@0.33.1
-        with:
-          image-ref: mittelconnect:ci
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: "1"
-      - name: Scan monitor image
-        uses: aquasecurity/trivy-action@0.33.1
-        with:
-          image-ref: mittelconnect-monitor:ci
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: "1"
+      - name: Install Trivy from Aqua Security's signed apt repository
+        run: |
+          sudo apt-get install -y --no-install-recommends wget gnupg
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install -y trivy
+          trivy --version
+      - name: Scan images (fixable HIGH/CRITICAL fail the build)
+        run: |
+          for image in mittelconnect:ci mittelconnect-monitor:ci; do
+            trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress "$image"
+          done
