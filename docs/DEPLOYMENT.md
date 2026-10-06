@@ -2,7 +2,9 @@
 
 This guide takes a customer site from nothing to a monitored production
 installation. The sandbox (`docker-compose.yml`) is for testing only; production
-uses `deploy/docker-compose.prod.yml`.
+uses `deploy/docker-compose.prod.yml`. Tick off `docs/PRODUCTION_CHECKLIST.md`
+before a site goes live; it covers sealing the master key
+(`scripts/seal_master_key.sh`) and central logs (`deploy/docker-compose.logging.yml`).
 
 ## 1. Choose the topology
 

@@ -1,0 +1,83 @@
+// Ships MittelConnect container logs to a central Loki over the private
+// network. Reads Docker's json-file logs read-only: no Docker socket, so a
+// compromised shipper cannot control containers.
+//
+// Only lines carrying the com.mittelconnect.service label (set by
+// deploy/docker-compose.prod.yml through the json-file "labels" option) are
+// shipped; everything else on the host is dropped.
+
+local.file_match "containers" {
+  path_targets = [{"__path__" = "/var/lib/docker/containers/*/*-json.log"}]
+}
+
+loki.source.file "containers" {
+  targets    = local.file_match.containers.targets
+  forward_to = [loki.process.mittelconnect.receiver]
+}
+
+loki.process "mittelconnect" {
+  stage.json {
+    expressions = {
+      log     = "log",
+      stream  = "stream",
+      time    = "time",
+      site    = "attrs.\"com.mittelconnect.site\"",
+      service = "attrs.\"com.mittelconnect.service\"",
+    }
+  }
+
+  stage.labels {
+    values = {
+      site    = "",
+      service = "",
+      stream  = "",
+    }
+  }
+
+  // No service label: not a MittelConnect container.
+  stage.match {
+    selector = "{service=\"\"}"
+    action   = "drop"
+  }
+
+  // The middleware logs JSON; lift its level into a label for alert rules.
+  stage.match {
+    selector = "{service=\"middleware\"}"
+
+    stage.json {
+      source      = "log"
+      expressions = { level = "level" }
+    }
+
+    stage.labels {
+      values = { level = "" }
+    }
+  }
+
+  // The file path holds the container id, which changes on every redeploy.
+  stage.label_drop {
+    values = ["filename"]
+  }
+
+  stage.timestamp {
+    source = "time"
+    format = "RFC3339Nano"
+  }
+
+  stage.output {
+    source = "log"
+  }
+
+  forward_to = [loki.write.central.receiver]
+}
+
+loki.write "central" {
+  endpoint {
+    url = sys.env("MC_LOKI_URL")
+
+    basic_auth {
+      username      = sys.env("MC_LOKI_USER")
+      password_file = "/run/secrets/loki_password"
+    }
+  }
+}

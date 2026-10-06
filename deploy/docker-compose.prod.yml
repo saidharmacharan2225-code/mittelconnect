@@ -4,19 +4,37 @@
 #   middleware  Python daemon: legacy DB -> SAP, hardened container
 #   monitor     Go sidecar (mcmon): /metrics, /healthz, /readyz
 #
+# Not in this file on purpose: SQL Server and SAP. In production both belong
+# to the customer and are reached over the plant network or the WireGuard
+# tunnel. The sandbox containers (mssql, simulator, mock-sap) never ship.
+#
 # Site files live outside the code checkout, under MC_SITE_DIR
 # (default /srv/mittelconnect/site), created by scripts/site_init.sh:
 #   config.yaml          site configuration (copied from config.yaml)
-#   .env                 ENC[...] secrets and site settings (0600)
-#   secrets/master.key   Fernet master key (0400, uid 10001)
+#   .env                 ENC[...] ciphertexts and site settings, no plaintext (0640)
+#   secrets/master.key   Fernet master key (0400, uid 10001); after
+#                        scripts/seal_master_key.sh only the sealed
+#                        master.key.cred remains and the plaintext key lives
+#                        in tmpfs at /run/mittelconnect/master.key
 #   data/                outbox, dead letters, watermarks, heartbeat (0700, uid 10001)
 #
 # Run (normally via scripts/deploy.sh):
 #   docker compose -f deploy/docker-compose.prod.yml \
 #     --env-file /srv/mittelconnect/site/.env up -d --build
+# Central log shipping (optional): add -f deploy/docker-compose.logging.yml
 # =============================================================================
 
 name: mittelconnect
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "10"
+    compress: "true"
+    # Container name in every line, so shipped logs stay attributable.
+    tag: "{{.Name}}"
+    labels: "com.mittelconnect.site,com.mittelconnect.service"
 
 services:
   middleware:
@@ -25,10 +43,16 @@ services:
       dockerfile: Dockerfile
     image: ${MC_IMAGE:-mittelconnect:1.0.0}
     init: true
+    labels:
+      com.mittelconnect.site: ${MC_SITE_NAME:?MC_SITE_NAME missing in site .env}
+      com.mittelconnect.service: middleware
     environment:
       MC_INSTANCE_NAME: ${MC_SITE_NAME:?MC_SITE_NAME missing in site .env}
       MC_LOG_LEVEL: ${MC_LOG_LEVEL:-INFO}
+      # Structured JSON on stdout only; Docker owns rotation and shipping.
       MC_LOG_FORMAT: json
+      # Only ENC[...] ciphertexts come from the site .env. They are useless
+      # without the master key, which is mounted as a Docker secret below.
       MC_MSSQL_PASSWORD: ${MC_MSSQL_PASSWORD_ENC:-}
       MC_ORACLE_PASSWORD: ${MC_ORACLE_PASSWORD_ENC:-}
       MC_SAP_CLIENT_SECRET: ${MC_SAP_CLIENT_SECRET_ENC:-}
@@ -50,24 +74,34 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      # Same probe as the image: the daemon loop touches the heartbeat file
+      # every cycle, so a stale file means a hung or crashed loop. SAP being
+      # down does NOT make it unhealthy; that is the outbox's job.
+      test: ["CMD", "python", "-c", "import os,sys,time; p=os.environ['MC_HEARTBEAT_FILE']; m=float(os.environ['MC_HEALTH_MAX_AGE_SECONDS']); sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p) < m else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      start_interval: 5s
+      retries: 3
     deploy:
       resources:
         limits:
           cpus: "${MC_CPUS:-1.5}"
           memory: ${MC_MEMORY:-1G}
           pids: 256
+    # Long enough to finish an in-flight SAP $batch and checkpoint the WAL.
     stop_grace_period: 45s
     restart: unless-stopped
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "10"
+    logging: *logging
 
   monitor:
     build:
       context: ../monitor
     image: ${MCMON_IMAGE:-mittelconnect-monitor:1.0.0}
+    labels:
+      com.mittelconnect.site: ${MC_SITE_NAME:?MC_SITE_NAME missing in site .env}
+      com.mittelconnect.service: monitor
     environment:
       MCMON_LISTEN: ":9464"
       MCMON_CACHE_PATH: /app/data/mittelconnect_cache.db
@@ -88,6 +122,14 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      # Checks mcmon itself, not the middleware: the monitor must stay up and
+      # report precisely when the middleware is sick.
+      test: ["CMD", "/usr/local/bin/mcmon", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
     deploy:
       resources:
         limits:
@@ -95,14 +137,24 @@ services:
           memory: 64M
           pids: 64
     depends_on:
-      - middleware
+      middleware:
+        # service_started, not service_healthy: waiting for a healthy
+        # middleware would keep the monitor down during exactly the incident
+        # it exists to report.
+        condition: service_started
     restart: unless-stopped
     logging:
       driver: json-file
       options:
         max-size: "5m"
         max-file: "3"
+        compress: "true"
+        tag: "{{.Name}}"
+        labels: "com.mittelconnect.site,com.mittelconnect.service"
 
 secrets:
   master_key:
-    file: ${MC_SITE_DIR:-/srv/mittelconnect/site}/secrets/master.key
+    # Sealed hosts (scripts/seal_master_key.sh) set MC_HOST_MASTER_KEY_FILE to
+    # /run/mittelconnect/master.key, a tmpfs copy decrypted at boot by
+    # mittelconnect-master-key.service. Unsealed hosts keep the old path.
+    file: ${MC_HOST_MASTER_KEY_FILE:-${MC_SITE_DIR:-/srv/mittelconnect/site}/secrets/master.key}
