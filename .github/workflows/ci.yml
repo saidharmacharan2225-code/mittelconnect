@@ -119,7 +119,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Bootstrap secrets and build the middleware image
-        run: ./scripts/bootstrap_sandbox.sh
+        run: bash scripts/bootstrap_sandbox.sh
       - name: Start the sandbox with the monitor and wait for a healthy middleware
         run: |
           docker compose -f docker-compose.yml -f docker-compose.monitor.yml up -d --build
@@ -131,7 +131,7 @@ jobs:
           echo "middleware did not become healthy" >&2
           exit 1
       - name: Outage drill (60 s SAP outage)
-        run: ./scripts/outage_drill.sh 60
+        run: bash scripts/outage_drill.sh 60
       - name: Monitor reports an empty outbox
         run: curl -fsS http://127.0.0.1:9464/metrics | grep -E '^mittelconnect_outbox_records\{.*\} 0$'
       - name: No duplicate deliveries to SAP
@@ -146,7 +146,7 @@ jobs:
           "
       - name: Sandbox logs
         if: failure()
-        run: docker compose -f docker-compose.yml -f docker-compose.monitor.yml logs --no-color --tail 200
+        run: docker compose -f docker-compose.yml -f docker-compose.monitor.yml logs --no-color --tail 200 || true
       - name: Tear down
         if: always()
-        run: docker compose -f docker-compose.yml -f docker-compose.monitor.yml down -v
+        run: docker compose -f docker-compose.yml -f docker-compose.monitor.yml down -v || true
