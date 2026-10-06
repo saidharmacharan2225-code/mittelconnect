@@ -26,7 +26,7 @@ jobs:
       - name: Install system ODBC headers for pyodbc
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends unixodbc-dev
       - run: pip install -r requirements.txt
-      - run: python -m compileall -q core main.py mock_sap
+      - run: python -m compileall -q core main.py mock_sap scripts/sandbox.py
       - run: python -m unittest discover -s tests -t . -v
 
   go:
@@ -110,3 +110,43 @@ jobs:
           for image in mittelconnect:ci mittelconnect-monitor:ci; do
             trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress "$image"
           done
+
+  sandbox-drill:
+    name: Sandbox outage drill
+    runs-on: ubuntu-24.04
+    needs: [python, go]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap secrets and build the middleware image
+        run: ./scripts/bootstrap_sandbox.sh
+      - name: Start the sandbox with the monitor and wait for a healthy middleware
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.monitor.yml up -d --build
+          for _ in $(seq 1 60); do
+            status="$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose ps -q middleware)" 2>/dev/null || true)"
+            if [ "$status" = "healthy" ]; then exit 0; fi
+            sleep 5
+          done
+          echo "middleware did not become healthy" >&2
+          exit 1
+      - name: Outage drill (60 s SAP outage)
+        run: ./scripts/outage_drill.sh 60
+      - name: Monitor reports an empty outbox
+        run: curl -fsS http://127.0.0.1:9464/metrics | grep -E '^mittelconnect_outbox_records\{.*\} 0$'
+      - name: No duplicate deliveries to SAP
+        run: |
+          docker compose exec -T mock-sap python3 -c "
+          import collections, json, sys
+          rows = [json.loads(line) for line in open('/data/received.jsonl')]
+          keys = collections.Counter((r['Material'], r['Plant'], r['StorageLocation'], r['YY1_ChangedAt_MMD']) for r in rows)
+          dupes = sum(1 for n in keys.values() if n > 1)
+          print(f'{dupes} duplicates in {len(rows)} records')
+          sys.exit(1 if dupes else 0)
+          "
+      - name: Sandbox logs
+        if: failure()
+        run: docker compose -f docker-compose.yml -f docker-compose.monitor.yml logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.monitor.yml down -v

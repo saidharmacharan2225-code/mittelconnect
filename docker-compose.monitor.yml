@@ -1,0 +1,34 @@
+# =============================================================================
+# Sandbox overlay: adds the Go monitor (mcmon) next to the middleware, the same
+# way deploy/docker-compose.prod.yml runs it on a customer site.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.monitor.yml up -d --build
+#   curl -s http://127.0.0.1:9464/metrics
+# =============================================================================
+
+services:
+  monitor:
+    build:
+      context: ./monitor
+    image: mittelconnect-monitor:1.0.0
+    environment:
+      MCMON_LISTEN: ":9464"
+      MCMON_CACHE_PATH: /app/data/mittelconnect_cache.db
+      MCMON_HEARTBEAT_FILE: /app/data/heartbeat
+      MCMON_HEALTH_MAX_AGE_SECONDS: "180"
+      MCMON_SOURCE_TZ: Europe/Berlin
+      MCMON_SITE: sandbox
+    volumes:
+      # Read-write because SQLite WAL readers need the shared-memory file;
+      # mcmon opens the database with mode=ro.
+      - middleware-data:/app/data
+    ports:
+      - "127.0.0.1:9464:9464"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - middleware
+    restart: unless-stopped
