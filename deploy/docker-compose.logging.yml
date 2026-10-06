@@ -1,0 +1,64 @@
+# =============================================================================
+# Optional overlay: ship MittelConnect logs to a central Loki (Grafana Cloud
+# or your own Loki on the monitoring server), reached over the private network.
+#
+#   docker compose -f deploy/docker-compose.prod.yml \
+#     -f deploy/docker-compose.logging.yml \
+#     --env-file /srv/mittelconnect/site/.env up -d
+#
+# Site .env:   MC_LOKI_URL=https://<loki>/loki/api/v1/push
+#              MC_LOKI_USER=<tenant or user id>
+# Secret file: $MC_SITE_DIR/secrets/loki_password (0400 root, push-only token)
+#
+# Local json-file logs stay in place, so `docker compose logs` keeps working
+# and nothing is lost while Loki is unreachable (Alloy resumes from its
+# saved read positions).
+# =============================================================================
+
+services:
+  log-shipper:
+    image: grafana/alloy:v1.11.3
+    command:
+      - run
+      - --storage.path=/var/lib/mc-alloy
+      - --server.http.listen-addr=127.0.0.1:12345
+      - /etc/alloy/config.alloy
+    environment:
+      MC_LOKI_URL: ${MC_LOKI_URL:?MC_LOKI_URL missing in site .env}
+      MC_LOKI_USER: ${MC_LOKI_USER:?MC_LOKI_USER missing in site .env}
+    secrets:
+      - source: loki_password
+        target: loki_password
+    volumes:
+      - ./logging/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - alloy-data:/var/lib/mc-alloy
+    # Root is needed to read Docker's 0640 log files; everything else is taken away.
+    user: "0:0"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
+    # No container health check: the image ships no HTTP client. Alert on
+    # silence instead (absent_over_time on the site's logs in Loki).
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+secrets:
+  loki_password:
+    file: ${MC_SITE_DIR:-/srv/mittelconnect/site}/secrets/loki_password
+
+volumes:
+  alloy-data:

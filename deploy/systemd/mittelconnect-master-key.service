@@ -1,0 +1,20 @@
+# Decrypts the sealed MittelConnect master key into tmpfs before Docker starts.
+# Installed and enabled by scripts/seal_master_key.sh, which replaces
+# @SITE_DIR@ with the site directory. The plaintext key only ever exists in
+# /run (RAM), never on the data volume or in its snapshots.
+[Unit]
+Description=Unseal MittelConnect master key into /run/mittelconnect
+Before=docker.service
+RequiresMountsFor=@SITE_DIR@
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+UMask=0277
+RuntimeDirectory=mittelconnect
+RuntimeDirectoryMode=0711
+ExecStart=/usr/bin/systemd-creds decrypt --name=mittelconnect-master-key @SITE_DIR@/secrets/master.key.cred /run/mittelconnect/master.key
+ExecStartPost=/usr/bin/chown 10001:10001 /run/mittelconnect/master.key
+
+[Install]
+WantedBy=docker.service
